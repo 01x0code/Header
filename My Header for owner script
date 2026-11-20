@@ -1,0 +1,236 @@
+-- เคลียร์ของเก่าถ้ารันสคริปต์ซ้ำ
+if getgenv()._OverheadHeaderCleanup then
+    pcall(getgenv()._OverheadHeaderCleanup)
+end
+
+local cloneref = cloneref or function(obj) return obj end
+local Players = cloneref(game:GetService("Players"))
+local RunService = cloneref(game:GetService("RunService"))
+local CoreGui = cloneref(game:GetService("CoreGui"))
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ==========================================
+-- CONFIG: กำหนดรายชื่อผู้เล่นและข้อความเหนือหัว
+-- รูปแบบ: ["ชื่อในเกม (Username)"] = "ข้อความที่ต้องการแสดง"
+-- ==========================================
+local CONFIG = {
+    ["Lunarplyr"] = "Lunarplyr:ScriptOwner",
+
+    -- เพิ่มบรรทัดต่อได้เรื่อยๆ เช่น:
+    -- ["PlayerName2"] = "MEMBER",
+}
+
+-- ตั้งค่าระยะและขนาดตัวอักษร
+local SETTINGS = {
+    StudsOffset = Vector3.new(0, 3.2, 0), -- ความสูงเหนือหัว
+    MinDistance = 8,                      -- ระยะใกล้สุด (studs)
+    MaxDistance = 120,                    -- ระยะไกลสุด (studs)
+    MaxTextSize = 25,                     -- ขนาดตัวอักษรสูงสุดตอนอยู่ใกล้
+    MinTextSize = 10,                     -- ขนาดตัวอักษรต่ำสุดตอนอยู่ไกล
+    ShowForSelf = true,                   -- true = โชว์บนหัวตัวเองด้วย / false = โชว์เฉพาะคนอื่น
+}
+
+local function getSafeContainer()
+    if typeof(gethui) == "function" then
+        local ok, ui = pcall(gethui)
+        if ok and ui then return ui end
+    end
+    local ok = pcall(function() return CoreGui.Name end)
+    if ok then return CoreGui end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local guiContainer = getSafeContainer()
+local activeHeaders = {}
+local connections = {}
+local playerToken = {} -- ใช้เช็กเวอร์ชันการเกิดล่าสุดของแต่ละคน กัน race condition
+
+local function getAdorneePart(character)
+    if not character or not character.Parent then return nil end
+    local head = character:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then return head end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then return root end
+    return character.PrimaryPart
+end
+
+local function computeTextSizeFromDistance(distance)
+    local clamped = math.clamp(distance, SETTINGS.MinDistance, SETTINGS.MaxDistance)
+    local alpha = (clamped - SETTINGS.MinDistance) / math.max(1, (SETTINGS.MaxDistance - SETTINGS.MinDistance))
+    local size = SETTINGS.MaxTextSize + (SETTINGS.MinTextSize - SETTINGS.MaxTextSize) * alpha
+    return math.round(size)
+end
+
+local function removeHeaderForPlayer(player)
+    local entry = activeHeaders[player]
+    if entry then
+        if entry.billboard then
+            pcall(function()
+                entry.billboard:Destroy()
+            end)
+        end
+        activeHeaders[player] = nil
+    end
+end
+
+local function createHeaderForPlayer(player, character, customText)
+    removeHeaderForPlayer(player)
+
+    if not player or not player.Parent then return end
+    if not character or not character.Parent then return end
+    if player.Character ~= character then return end
+
+    local adornee = getAdorneePart(character)
+    if not adornee then return end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "CustomRankHeader_" .. tostring(player.UserId)
+    billboard.Adornee = adornee
+    billboard.StudsOffset = SETTINGS.StudsOffset
+    billboard.Size = UDim2.fromOffset(260, 50)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 0
+    billboard.Parent = guiContainer
+
+    local label = Instance.new("TextLabel")
+    label.Name = "RankLabel"
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Text = customText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.TextStrokeTransparency = 0.35
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = SETTINGS.MaxTextSize
+    label.TextWrapped = true
+    label.Parent = billboard
+
+    activeHeaders[player] = {
+        billboard = billboard,
+        label = label,
+        character = character,
+    }
+end
+
+local function attachWhenReady(player, char, customText)
+    if not char or not customText then return end
+
+    -- เพิ่มเลขรอบการเกิดใหม่ เพื่อยกเลิก task เก่าที่ค้างอยู่
+    local currentToken = (playerToken[player] or 0) + 1
+    playerToken[player] = currentToken
+
+    removeHeaderForPlayer(player)
+
+    task.spawn(function()
+        -- รอจนกว่าจะมี Head หรือ HumanoidRootPart หรือหมดเวลา
+        local deadline = os.clock() + 8
+        local part = getAdorneePart(char)
+
+        while not part and os.clock() < deadline do
+            if not player.Parent or not char.Parent or playerToken[player] ~= currentToken then
+                return
+            end
+            task.wait(0.05)
+            part = getAdorneePart(char)
+        end
+
+        if not part then return end
+        if not player.Parent or not char.Parent or playerToken[player] ~= currentToken then
+            return
+        end
+        if player.Character ~= char then
+            return
+        end
+
+        createHeaderForPlayer(player, char, customText)
+    end)
+end
+
+local function setupPlayer(player)
+    if player == LocalPlayer and not SETTINGS.ShowForSelf then
+        return
+    end
+
+    local customText = CONFIG[player.Name]
+    if not customText then
+        return
+    end
+
+    -- กรณีผู้เล่นมีตัวละครอยู่แล้วตอนรันสคริปต์
+    if player.Character then
+        attachWhenReady(player, player.Character, customText)
+    end
+
+    -- กรณีตายแล้วเกิดใหม่ (หรือเปลี่ยนตัวละคร)
+    table.insert(connections, player.CharacterAdded:Connect(function(char)
+        local latestText = CONFIG[player.Name]
+        if latestText then
+            attachWhenReady(player, char, latestText)
+        end
+    end))
+
+    -- กรณีตัวละครเก่าถูกลบ / กำลังรีเซ็ต
+    table.insert(connections, player.CharacterRemoving:Connect(function()
+        playerToken[player] = (playerToken[player] or 0) + 1
+        removeHeaderForPlayer(player)
+    end))
+end
+
+for _, plr in ipairs(Players:GetPlayers()) do
+    setupPlayer(plr)
+end
+
+table.insert(connections, Players.PlayerAdded:Connect(setupPlayer))
+table.insert(connections, Players.PlayerRemoving:Connect(function(plr)
+    playerToken[plr] = nil
+    removeHeaderForPlayer(plr)
+end))
+
+table.insert(connections, RunService.RenderStepped:Connect(function()
+    local myChar = LocalPlayer.Character
+    local myRoot = getAdorneePart(myChar)
+
+    for player, entry in pairs(activeHeaders) do
+        local customText = CONFIG[player.Name]
+        if not player.Parent or not customText then
+            removeHeaderForPlayer(player)
+        elseif not entry.character or not entry.character.Parent or player.Character ~= entry.character then
+            -- ถ้าร่างเก่าหายไปแล้วแต่ตัวละครใหม่มาแล้ว ให้เรียกสร้างใหม่ทันที
+            if player.Character then
+                attachWhenReady(player, player.Character, customText)
+            else
+                removeHeaderForPlayer(player)
+            end
+        else
+            local targetPart = getAdorneePart(entry.character)
+            if targetPart then
+                if not entry.billboard or not entry.billboard.Parent then
+                    createHeaderForPlayer(player, entry.character, customText)
+                elseif entry.billboard.Adornee ~= targetPart then
+                    entry.billboard.Adornee = targetPart
+                end
+
+                if myRoot and activeHeaders[player] and activeHeaders[player].label then
+                    local distance = (targetPart.Position - myRoot.Position).Magnitude
+                    activeHeaders[player].label.TextSize = computeTextSizeFromDistance(distance)
+                end
+            end
+        end
+    end
+end))
+
+-- ฟังก์ชันล้างระบบทั้งหมด (เรียก getgenv()._OverheadHeaderCleanup() เพื่อปิดได้)
+getgenv()._OverheadHeaderCleanup = function()
+    for _, conn in ipairs(connections) do
+        if conn.Connected then
+            conn:Disconnect()
+        end
+    end
+    table.clear(connections)
+    table.clear(playerToken)
+
+    for player in pairs(activeHeaders) do
+        removeHeaderForPlayer(player)
+    end
+end
